@@ -4,6 +4,7 @@ import bauiv1 as bui
 from bauiv1lib import popup, confirm
 from bauiv1lib.settings.allsettings import AllSettingsWindow
 
+import urllib.error
 import urllib.request
 import http.client
 import socket
@@ -12,7 +13,6 @@ import ssl
 
 import re
 import os
-import sys
 import copy
 import asyncio
 import pathlib
@@ -25,7 +25,7 @@ from datetime import datetime
 # Modules used for overriding AllSettingsWindow
 import logging
 
-PLUGIN_MANAGER_VERSION = "1.1.10"
+PLUGIN_MANAGER_VERSION = "1.1.11"
 REPOSITORY_URL = "https://github.com/bombsquad-community/plugin-manager"
 # Current tag can be changed to "staging" or any other branch in
 # plugin manager repo for testing purpose.
@@ -43,11 +43,9 @@ HEADERS = {
 }
 PLUGIN_DIRECTORY = _env["python_directory_user"]
 
-# compatibility for older API versions.
-if _env.get("build_number", 0) < 22714:
-    babase._asyncio._g_asyncio_event_loop = babase._asyncio._asyncio_event_loop
 
-loop = babase._asyncio._g_asyncio_event_loop
+loop = babase.app.asyncio_loop
+pool = babase.app.threadpool
 
 open_popups = []
 
@@ -130,7 +128,7 @@ def send_network_request(request):
 
 
 async def async_send_network_request(request):
-    response = await loop.run_in_executor(None, send_network_request, request)
+    response = await loop.run_in_executor(pool, send_network_request, request)
     return response
 
 
@@ -160,7 +158,7 @@ def stream_network_response_to_file(request, file, md5sum=None, retries=3):
 async def async_stream_network_response_to_file(request, file, md5sum=None, retries=3):
 
     content = await loop.run_in_executor(
-        None,
+        pool,
         stream_network_response_to_file,
         request,
         file,
@@ -201,40 +199,45 @@ class DNSBlockWorkaround:
 
     _google_dns_cache = {}
 
-    def apply():
+    @classmethod
+    def apply(cls):
         opener = urllib.request.build_opener(
-            DNSBlockWorkaround._HTTPHandler,
-            DNSBlockWorkaround._HTTPSHandler,
+            cls._HTTPHandler,
+            cls._HTTPSHandler,
         )
         urllib.request.install_opener(opener)
 
-    def _resolve_using_google_dns(hostname):
+    @classmethod
+    def _resolve_using_google_dns(cls, hostname):
         response = urllib.request.urlopen(f"https://dns.google/resolve?name={hostname}")
         response = response.read()
         response = json.loads(response)
         resolved_host = response["Answer"][0]["data"]
         return resolved_host
 
-    def _resolve_using_system_dns(hostname):
+    @classmethod
+    def _resolve_using_system_dns(cls, hostname):
         resolved_host = socket.gethostbyname(hostname)
         return resolved_host
 
-    def _resolve_with_workaround(hostname):
-        resolved_host_from_cache = DNSBlockWorkaround._google_dns_cache.get(hostname)
+    @classmethod
+    def _resolve_with_workaround(cls, hostname):
+        resolved_host_from_cache = cls._google_dns_cache.get(hostname)
         if resolved_host_from_cache:
             return resolved_host_from_cache
 
-        resolved_host_by_system_dns = DNSBlockWorkaround._resolve_using_system_dns(hostname)
+        resolved_host_by_system_dns = cls._resolve_using_system_dns(hostname)
 
-        if DNSBlockWorkaround._is_blocked(hostname, resolved_host_by_system_dns):
-            resolved_host = DNSBlockWorkaround._resolve_using_google_dns(hostname)
-            DNSBlockWorkaround._google_dns_cache[hostname] = resolved_host
+        if cls._is_blocked(hostname, resolved_host_by_system_dns):
+            resolved_host = cls._resolve_using_google_dns(hostname)
+            cls._google_dns_cache[hostname] = resolved_host
         else:
             resolved_host = resolved_host_by_system_dns
 
         return resolved_host
 
-    def _is_blocked(hostname, address):
+    @classmethod
+    def _is_blocked(cls, hostname, address):
         is_blocked = False
         if hostname == "raw.githubusercontent.com":
             # Jio's DNS server may be blocking it.
@@ -578,7 +581,7 @@ class PluginLocal:
             if not self.is_installed:
                 raise PluginNotInstalled("Plugin is not available locally.")
 
-            self._content = await loop.run_in_executor(None, self._get_content)
+            self._content = await loop.run_in_executor(pool, self._get_content)
         return self._content
 
     async def get_api_version(self):
@@ -659,7 +662,7 @@ class PluginLocal:
         self.save()
 
     def load_plugin(self, entry_point):
-        plugin_class = babase._general.getclass(entry_point, babase.Plugin)
+        plugin_class = babase.getclass(entry_point, babase.Plugin)
         loaded_plugin_instance = plugin_class()
         loaded_plugin_instance.on_app_running()
 
@@ -683,7 +686,7 @@ class PluginLocal:
     async def set_content(self, content):
         if not self._content:
 
-            await loop.run_in_executor(None, self._set_content, content)
+            await loop.run_in_executor(pool, self._set_content, content)
             self._content = content
         return self
 
@@ -869,7 +872,7 @@ class PluginManager:
         self._index = _CACHE.get("index", {})
         self._changelog = _CACHE.get("changelog", {})
         self.categories = {}
-        self.module_path = sys.modules[__name__].__file__
+        self.module_path = __file__
         self._index_setup_in_progress = False
         self._changelog_setup_in_progress = False
 
@@ -899,7 +902,7 @@ class PluginManager:
         await self.setup_plugin_categories(index)
         self._index_setup_in_progress = False
 
-    async def get_changelog(self) -> list[str, bool]:
+    async def get_changelog(self) -> tuple[str, bool]:
         requested = False
         if not self._changelog:
             request = urllib.request.Request(CHANGELOG_META.format(
@@ -911,7 +914,7 @@ class PluginManager:
             response = await async_send_network_request(request)
             self._changelog = response.read().decode()
             requested = True
-        return [self._changelog, requested]
+        return self._changelog, requested
 
     async def setup_changelog(self, version=None) -> None:
         if version is None:
@@ -930,6 +933,7 @@ class PluginManager:
                     released_on = full_changelog[0].split(version)[1].split('\n')[0]
                     matches = re.findall(pattern, full_changelog[0], re.DOTALL)
                 else:
+                    released_on = ' (Not Provided)'
                     matches = None
 
                 if matches:
@@ -938,7 +942,7 @@ class PluginManager:
                         'info': matches[0].strip()
                     }
                 else:
-                    changelog = {'released_on': ' (Not Provided)',
+                    changelog = {'released_on': released_on,
                                  'info': f"Changelog entry for version {version} not found."}
             else:
                 changelog = full_changelog[0]
@@ -1735,6 +1739,7 @@ class PluginWindow(popup.PopupWindow):
         _remove_popup(self)
         bui.containerwidget(edit=self._root_widget, transition='out_scale')
 
+    @staticmethod
     def button(fn):
         async def asyncio_handler(fn, self, *args, **kwargs):
             await fn(self, *args, **kwargs)
@@ -2260,8 +2265,8 @@ class PluginManagerWindow(bui.MainWindow):
 
     def __init__(
         self,
-        transition: str = "in_right",
-        origin_widget: bui.Widget = None
+        transition: str | None = "in_right",
+        origin_widget: bui.Widget | None = None
     ):
         self.plugin_manager = PluginManager()
         self.category_selection_button = None
@@ -3419,7 +3424,6 @@ class EntryPoint(babase.Plugin):
         from bauiv1lib.settings import allsettings
         allsettings.AllSettingsWindow = NewAllSettingsWindow
         DNSBlockWorkaround.apply()
-        asyncio.set_event_loop(babase._asyncio._g_asyncio_event_loop)
         startup_tasks = StartupTasks()
 
         loop.create_task(startup_tasks.execute())
